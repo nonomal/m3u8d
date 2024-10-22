@@ -4,17 +4,19 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/yapingcat/gomedia/codec"
-	"github.com/yapingcat/gomedia/mp4"
-	"github.com/yapingcat/gomedia/mpeg2"
+	"github.com/yapingcat/gomedia/go-codec"
+	"github.com/yapingcat/gomedia/go-mp4"
+	"github.com/yapingcat/gomedia/go-mpeg2"
 	"io/ioutil"
 	"os"
 	"strconv"
+	"time"
 )
 
 type MergeTsFileListToSingleMp4_Req struct {
 	TsFileList []string
 	OutputMp4  string
+	Status     *SpeedStatus
 	Ctx        context.Context
 }
 
@@ -25,11 +27,15 @@ func MergeTsFileListToSingleMp4(req MergeTsFileListToSingleMp4_Req) (err error) 
 	}
 	defer mp4file.Close()
 
+	if req.Status != nil {
+		req.Status.SpeedResetBytes()
+	}
+
 	muxer, err := mp4.CreateMp4Muxer(mp4file)
 	if err != nil {
 		return err
 	}
-	vtid := muxer.AddVideoTrack(mp4.MP4_CODEC_H264)
+	var vtid uint32 // video track id
 	atid := muxer.AddAudioTrack(mp4.MP4_CODEC_AAC)
 
 	demuxer := mpeg2.NewTSDemuxer()
@@ -41,6 +47,7 @@ func MergeTsFileListToSingleMp4(req MergeTsFileListToSingleMp4_Req) (err error) 
 			return
 		}
 		if cid == mpeg2.TS_STREAM_AAC {
+			audioTimestamp = pts
 			codec.SplitAACFrame(frame, func(aac []byte) {
 				if aacSampleRate == -1 {
 					adts := codec.NewAdtsFrameHeader()
@@ -54,8 +61,19 @@ func MergeTsFileListToSingleMp4(req MergeTsFileListToSingleMp4_Req) (err error) 
 					return
 				}
 			})
-		} else if cid == mpeg2.TS_STREAM_H264 {
-			err = muxer.Write(vtid, frame, uint64(pts), uint64(dts))
+		} else if cid == mpeg2.TS_STREAM_H264 || cid == mpeg2.TS_STREAM_H265 {
+			if vtid == 0 {
+				switch cid {
+				case mpeg2.TS_STREAM_H264:
+					vtid = muxer.AddVideoTrack(mp4.MP4_CODEC_H264)
+				case mpeg2.TS_STREAM_H265:
+					vtid = muxer.AddVideoTrack(mp4.MP4_CODEC_H265)
+				default:
+					OnFrameErr = errors.New("unknown cid2 " + strconv.Itoa(int(cid)))
+					return
+				}
+			}
+			err = muxer.Write(vtid, frame, pts, dts)
 			if err != nil {
 				OnFrameErr = err
 				return
@@ -66,13 +84,15 @@ func MergeTsFileListToSingleMp4(req MergeTsFileListToSingleMp4_Req) (err error) 
 		}
 	}
 
-	for idx, tsFile := range req.TsFileList {
+	if req.Status != nil {
+		req.Status.SpeedResetTotalBlockCount(len(req.TsFileList))
+	}
+	for _, tsFile := range req.TsFileList {
 		select {
 		case <-req.Ctx.Done():
 			return req.Ctx.Err()
 		default:
 		}
-		DrawProgressBar(len(req.TsFileList), idx)
 		var buf []byte
 		buf, err = ioutil.ReadFile(tsFile)
 		if err != nil {
@@ -85,6 +105,9 @@ func MergeTsFileListToSingleMp4(req MergeTsFileListToSingleMp4_Req) (err error) 
 		if OnFrameErr != nil {
 			return OnFrameErr
 		}
+		if req.Status != nil {
+			req.Status.SpeedAdd1Block(time.Now(), len(buf))
+		}
 	}
 
 	err = muxer.WriteTrailer()
@@ -95,6 +118,8 @@ func MergeTsFileListToSingleMp4(req MergeTsFileListToSingleMp4_Req) (err error) 
 	if err != nil {
 		return err
 	}
-	DrawProgressBar(1, 1)
+	if req.Status != nil {
+		req.Status.DrawProgressBar(1, 1)
+	}
 	return nil
 }

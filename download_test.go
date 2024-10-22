@@ -50,12 +50,12 @@ func TestGetTsList(t *testing.T) {
 }
 
 func tGetTsList(m3u8Url string, m3u8Content string, expectTs0Url string) {
-	list, errMsg := getTsList(m3u8Url, m3u8Content)
+	realUrl, errMsg := ResolveRefUrl(m3u8Url, m3u8Content)
 	if errMsg != "" {
 		panic(errMsg)
 	}
-	if list[0].Url != expectTs0Url {
-		panic(list[0].Url)
+	if realUrl != expectTs0Url {
+		panic(realUrl)
 	}
 }
 
@@ -84,13 +84,19 @@ func TestFull(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
-	resp2 := RunDownload(RunDownload_Req{
-		M3u8Url:  m3u8Url,
-		SaveDir:  saveDir,
-		FileName: "all",
+	var instance DownloadEnv
+	errMsg := instance.StartDownload(StartDownload_Req{
+		M3u8Url:     m3u8Url,
+		SaveDir:     saveDir,
+		FileName:    "all",
+		ThreadCount: 8,
 	})
-	if resp2.ErrMsg != "" {
-		panic(resp2.ErrMsg)
+	if errMsg != "" {
+		panic(errMsg)
+	}
+	status := instance.WaitDownloadFinish()
+	if status.ErrMsg != "" {
+		panic(status.ErrMsg)
 	}
 	fState, err := os.Stat(filepath.Join(saveDir, "all.mp4"))
 	if err != nil {
@@ -98,5 +104,23 @@ func TestFull(t *testing.T) {
 	}
 	if fState.Size() <= 100*1000 { // 100KB
 		panic("state error")
+	}
+}
+
+func TestGetFileName(t *testing.T) {
+	u1 := "https://example.com/video.m3u8"
+	u2 := "https://example.com/video.m3u8?query=1"
+	u3 := "https://example.com/video-name"
+
+	if GetFileNameFromUrl(u1) != "video" {
+		t.Fail()
+	}
+
+	if GetFileNameFromUrl(u2) != "video" {
+		t.Fail()
+	}
+
+	if GetFileNameFromUrl(u3) != "video-name" {
+		t.Fail()
 	}
 }

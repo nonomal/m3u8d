@@ -1,0 +1,208 @@
+# This is a basic workflow to help you get started with Actions
+
+name: release-build-upload
+
+# Controls when the workflow will run
+on: 
+  release:
+    types: [ created ]
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  build-upload_windows-x86:
+    # The type of runner that the job will run on
+    runs-on: windows-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v3
+    
+      - name: install qt static
+        uses: orestonce/install-qt@main
+        with:
+          version: Qt5.6.3-Windows-x86-MinGW4.9.4-staticFull-20200104
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+            go-version: '1.18'
+            cache-dependency-path: |
+             ./go.sum
+             ./go.sum
+             
+      - name: build
+        run: |
+          go mod tidy
+          go run export/main.go update-version-info
+          go run export/main.go build-cli
+          go run export/main.go create-qt-lib 386 c-archive
+          cd m3u8d-qt && qmake && mingw32-make release && cd ..
+          dir m3u8d-qt\release\m3u8d-qt.exe
+
+      - name: upload release m3u8d_windows_x86_qt
+        uses: Guerra24/upload-to-release@v1
+        with:
+          name: m3u8d_windows_x86_qt-${{ github.ref_name }}.exe
+          path: m3u8d-qt/release/m3u8d-qt.exe
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: upload release m3u8d_windows_x86_cli
+        uses: Guerra24/upload-to-release@v1
+        with:
+          name: m3u8d_windows_x86_cli-${{ github.ref_name }}.exe
+          path: bin/m3u8d_windows_386_cli.exe
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: upload release m3u8d_windows_x64_cli
+        uses: Guerra24/upload-to-release@v1
+        with:
+          name: m3u8d_windows_x64_cli-${{ github.ref_name }}.exe
+          path: bin/m3u8d_windows_amd64_cli.exe
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: upload release m3u8d_linux_x86_cli
+        uses: Guerra24/upload-to-release@v1
+        with:
+          name: m3u8d_linux_x86_cli-${{ github.ref_name }}
+          path: bin/m3u8d_linux_386_cli
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: upload release m3u8d_linux_x64_cli
+        uses: Guerra24/upload-to-release@v1
+        with:
+          name: m3u8d_linux_x64_cli-${{ github.ref_name }}
+          path: bin/m3u8d_linux_amd64_cli
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: upload release m3u8d_linux_arm_cli
+        uses: Guerra24/upload-to-release@v1
+        with:
+          name: m3u8d_linux_arm_cli-${{ github.ref_name }}
+          path: bin/m3u8d_linux_arm_cli
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: upload release m3u8d_linux_arm64_cli
+        uses: Guerra24/upload-to-release@v1
+        with:
+          name: m3u8d_linux_arm64_cli-${{ github.ref_name }}
+          path: bin/m3u8d_linux_arm64_cli
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: upload release m3u8d_linux_mipsle_cli
+        uses: Guerra24/upload-to-release@v1
+        with:
+          name: m3u8d_linux_mipsle_cli-${{ github.ref_name }}
+          path: bin/m3u8d_linux_mipsle_cli
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: upload release m3u8d_darwin_x64_cli
+        uses: Guerra24/upload-to-release@v1
+        with:
+          name: m3u8d_darwin_x64_cli-${{ github.ref_name }}
+          path: bin/m3u8d_darwin_amd64_cli
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: upload release m3u8d_android_arm64_cli
+        uses: Guerra24/upload-to-release@v1
+        with:
+          name: m3u8d_android_arm64_cli-${{ github.ref_name }}
+          path: bin/m3u8d_android_arm64_cli
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          
+  build-upload_windows-x64:
+    runs-on: windows-latest
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v3
+
+      - name: install qt static
+        uses: orestonce/install-qt@main
+        with:
+          version: Qt5.15.7-Windows-x86_64-MinGW8.1.0-staticFull-20221104
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+            go-version: '1.18'
+            cache-dependency-path: |
+             ./go.sum
+             ./go.sum
+             
+      - name: build
+        run: |
+          go mod tidy
+          go run export/main.go update-version-info
+          go run export/main.go create-qt-lib amd64 c-archive
+          cd m3u8d-qt && qmake && mingw32-make release && cd ..
+          dir m3u8d-qt\release\m3u8d-qt.exe
+      - name: upload release m3u8d_windows_x64_qt
+        uses: Guerra24/upload-to-release@v1
+        with:
+          name: m3u8d_windows_x64_qt-${{ github.ref_name }}.exe
+          path: m3u8d-qt/release/m3u8d-qt.exe
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+  build-upload_macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v3
+      - name: install qt
+        uses: orestonce/install-qt@main
+        with:
+          version: Qt6.7.2-macOS-Universal-AppleClang15.0.0-noFramework-20240621
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+            go-version: '1.18'
+            cache-dependency-path: |
+             ./go.sum
+             ./go.sum
+             
+      - name: build
+        run: |
+          set -x
+          set -e
+          go mod tidy
+          go run export/main.go update-version-info
+          go run export/main.go create-qt-lib arm64 c-shared
+          cd m3u8d-qt && qmake && make && cd ..
+          cd m3u8d-qt
+          install_name_tool -change m3u8d-impl @executable_path/m3u8d-impl m3u8d-qt.app/Contents/MacOS/m3u8d-qt
+          cp m3u8d-impl m3u8d-qt.app/Contents/MacOS/
+          macdeployqt m3u8d-qt.app -dmg 
+          ls -alh m3u8d-qt.dmg
+          file m3u8d-qt.dmg m3u8d-impl m3u8d-qt.app/Contents/MacOS/m3u8d-qt
+          cd ./m3u8d-qt.app
+          ./Contents/MacOS/m3u8d-qt test-startup
+      - name: upload release m3u8d_darwin_arm64_qt
+        uses: Guerra24/upload-to-release@v1
+        with:
+          name: m3u8d_darwin_arm64_qt-${{ github.ref_name }}.dmg
+          path: m3u8d-qt/m3u8d-qt.dmg
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+  build-upload_macos-amd64:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v3
+      - name: install qt
+        uses: orestonce/install-qt@main
+        with:
+          version: Qt6.7.2-macOS-Universal-AppleClang15.0.0-noFramework-20240621
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+            go-version: '1.18'
+            cache-dependency-path: |
+             ./go.sum
+             ./go.sum
+             
+      - name: build
+        run: |
+          set -x
+          set -e
+          go mod tidy
+          go run export/main.go update-version-info
+          go run export/main.go create-qt-lib amd64 c-shared
+          cd m3u8d-qt && qmake && make && cd ..
+          cd m3u8d-qt
+          install_name_tool -change m3u8d-impl @executable_path/m3u8d-impl m3u8d-qt.app/Contents/MacOS/m3u8d-qt
+          cp m3u8d-impl m3u8d-qt.app/Contents/MacOS/
+          macdeployqt m3u8d-qt.app -dmg 
+          file m3u8d-qt.dmg m3u8d-impl m3u8d-qt.app/Contents/MacOS/m3u8d-qt
+          cd ./m3u8d-qt.app
+          ./Contents/MacOS/m3u8d-qt test-startup
+      - name: upload release m3u8d_darwin_x64_qt
+        uses: Guerra24/upload-to-release@v1
+        with:
+          name: m3u8d_darwin_x64_qt-${{ github.ref_name }}.dmg
+          path: m3u8d-qt/m3u8d-qt.dmg
+          repo-token: ${{ secrets.GITHUB_TOKEN }}

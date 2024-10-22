@@ -3,38 +3,72 @@ package main
 import (
 	"fmt"
 	"github.com/orestonce/go2cpp"
+	"github.com/orestonce/m3u8d"
+	"github.com/orestonce/m3u8d/m3u8dcpp"
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"io/ioutil"
-	"m3u8d"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 )
 
-const version = "1.5.5"
-
 func main() {
-	BuildCliBinary()   // 编译二进制
-	CreateLibForQtUi() // 创建Qt需要使用的.a库文件
-	WriteVersionDotRc()
+	if os.Getenv("GITHUB_ACTIONS") == "" { // 本地编译
+		CreateLibForQtUi("amd64", "c-archive") // 创建Qt需要使用的.a库文件
+		BuildCliBinaryAllVersion()             // 编译命令行版本
+	} else if len(os.Args) >= 2 { // github actions 编译
+		switch os.Args[1] {
+		case "build-cli":
+			BuildCliBinaryAllVersion() // 编译命令行版本
+		case "update-version-info":
+			refName := os.Getenv("GITHUB_REF_NAME")
+			WriteVersionDotRc(refName)
+			sha := os.Getenv("GITHUB_SHA")
+			WriteVersionDotGo(refName, sha)
+		case "create-qt-lib":
+			goarch := os.Args[2]
+			buildMode := os.Args[3]
+			CreateLibForQtUi(goarch, buildMode)
+		default:
+			fmt.Println("help:")
+			fmt.Println("build-cli")
+			fmt.Println("update-qt-version-rc")
+			fmt.Println("create-qt-lib [goarch] [buildMode]")
+			fmt.Println("              goarch: 386, amd64, arm64...")
+			fmt.Println("              buildMode: c-shared, c-archive")
+		}
+	}
 }
 
-func BuildCliBinary() {
-	wd, err := os.Getwd()
-	if err != nil {
-		panic(err)
-	}
-	type buildCfg struct {
-		GOOS   string
-		GOARCH string
-		Ext    string
-	}
-	var list = []buildCfg{
+type BuildCfg struct {
+	GOOS   string
+	GOARCH string
+	Ext    string
+}
+
+func BuildCliBinaryAllVersion() {
+	var list = []BuildCfg{
+		{
+			GOOS:   "windows",
+			GOARCH: "386",
+			Ext:    ".exe",
+		},
+		{
+			GOOS:   "windows",
+			GOARCH: "amd64",
+			Ext:    ".exe",
+		},
 		{
 			GOOS:   "linux",
 			GOARCH: "386",
+		},
+		{
+			GOOS:   "linux",
+			GOARCH: "amd64",
 		},
 		{
 			GOOS:   "linux",
@@ -42,69 +76,83 @@ func BuildCliBinary() {
 		},
 		{
 			GOOS:   "linux",
+			GOARCH: "arm64",
+		},
+		{
+			GOOS:   "linux",
 			GOARCH: "mipsle",
+		},
+		{
+			GOOS:   "android",
+			GOARCH: "arm64",
 		},
 		{
 			GOOS:   "darwin",
 			GOARCH: "amd64",
 		},
-		{
-			GOOS:   "windows",
-			GOARCH: "386",
-			Ext:    ".exe",
-		},
 	}
 	for _, cfg := range list {
-		name := "m3u8d_cli_v" + version + "_" + cfg.GOOS + "_" + cfg.GOARCH + cfg.Ext
-		cmd := exec.Command("go", "build", "-trimpath", "-ldflags", "-s -w", "-o", filepath.Join(wd, "bin", name))
-		cmd.Dir = filepath.Join(wd, "cmd")
-		cmd.Env = append(os.Environ(), "GOOS="+cfg.GOOS)
-		cmd.Env = append(cmd.Env, "GOARCH="+cfg.GOARCH)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		err = cmd.Run()
-		if err != nil {
-			fmt.Println(cmd.Dir)
-			panic(err)
-		}
-		fmt.Println("done", name)
+		BuildCliVersion(cfg)
 	}
 }
 
-func CreateLibForQtUi() {
+func BuildCliVersion(cfg BuildCfg) {
+	wd, err := os.Getwd()
+	if err != nil {
+		panic(err)
+	}
+	name := "m3u8d_" + cfg.GOOS + "_" + cfg.GOARCH + "_cli" + cfg.Ext
+	cmd := exec.Command("go", "build", "-trimpath", "-ldflags", "-s -w", "-o", filepath.Join(wd, "bin", name))
+	cmd.Dir = filepath.Join(wd, "cmd")
+	cmd.Env = append(os.Environ(), "GOOS="+cfg.GOOS)
+	cmd.Env = append(cmd.Env, "GOARCH="+cfg.GOARCH)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err = cmd.Run()
+	if err != nil {
+		fmt.Println(cmd.Dir)
+		panic(err)
+	}
+	fmt.Println("done", name)
+}
+
+func CreateLibForQtUi(goarch string, buildmode string) {
 	ctx := go2cpp.NewGo2cppContext(go2cpp.NewGo2cppContext_Req{
 		CppBaseName:                 "m3u8d",
 		EnableQtClass_RunOnUiThread: true,
 		EnableQtClass_Toast:         true,
 	})
-	ctx.Generate1(m3u8d.RunDownload)
-	ctx.Generate1(m3u8d.CloseOldEnv)
-	ctx.Generate1(m3u8d.GetProgress)
+	ctx.Generate1(m3u8dcpp.StartDownload)
+	ctx.Generate1(m3u8dcpp.CloseOldEnv)
+	ctx.Generate1(m3u8dcpp.GetStatus)
+	ctx.Generate1(m3u8dcpp.WaitDownloadFinish)
 	ctx.Generate1(m3u8d.GetWd)
 	ctx.Generate1(m3u8d.ParseCurlStr)
 	ctx.Generate1(m3u8d.RunDownload_Req_ToCurlStr)
-	ctx.MustCreateAmd64LibraryInDir("m3u8d-qt")
+	ctx.Generate1(m3u8d.GetFileNameFromUrl)
+	ctx.Generate1(m3u8dcpp.MergeTsDir)
+	ctx.Generate1(m3u8dcpp.MergeStop)
+	ctx.Generate1(m3u8dcpp.MergeGetProgressPercent)
+	ctx.Generate1(m3u8d.FindUrlInStr)
+	ctx.Generate1(m3u8d.GetVersion)
+
+	var optionList []string
+	if runtime.GOOS == "darwin" {
+		optionList = []string{"-ldflags=-w"}
+	}
+	ctx.MustCreateLibrary("m3u8d-qt", goarch, buildmode, optionList...)
 }
 
-func WriteVersionDotRc() {
-	tmp := strings.Split(version, ".")
-	ok := len(tmp) == 3
-	for _, v := range tmp {
-		vi, err := strconv.Atoi(v)
-		if err != nil {
-			ok = false
-			break
-		}
-		if vi < 0 {
-			ok = false
-			break
-		}
-	}
-	if ok == false {
+var gVersionReg = regexp.MustCompile(`^v([0-9]+)\.([0-9]+)\.([0-9]+)$`)
+
+func WriteVersionDotRc(version string) {
+	groups := gVersionReg.FindStringSubmatch(version)
+	if len(groups) == 0 {
 		panic("version invalid: " + strconv.Quote(version))
 	}
-	tmp = append(tmp, "0")
-	v1 := strings.Join(tmp, ",")
+	versionPart3 := append(groups[1:], "0")
+	v1 := strings.Join(versionPart3, ",")
+	// TODO: 这里写中文github action会乱码, 有空研究一下
 	data := []byte(`IDI_ICON1 ICON "favicon.ico"
 
 #if defined(UNDER_CE)
@@ -131,9 +179,9 @@ VS_VERSION_INFO VERSIONINFO
             BLOCK "080404b0"
             BEGIN
                 VALUE "ProductVersion", "` + version + `.0\0"
-                VALUE "ProductName", "m3u8视频下载工具\0"
+                VALUE "ProductName", "m3u8 downloader\0"
                 VALUE "LegalCopyright", "https://github.com/orestonce/m3u8d\0"
-                VALUE "FileDescription", "m3u8视频下载工具\0"
+                VALUE "FileDescription", "m3u8 downloader\0"
            END
         END
 
@@ -148,6 +196,21 @@ VS_VERSION_INFO VERSIONINFO
 		panic(err)
 	}
 	err = ioutil.WriteFile("m3u8d-qt/version.rc", data, 0777)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func WriteVersionDotGo(version string, commitId string) {
+	content := `//注意: 此文件将被export/main.go更新
+
+package m3u8d
+
+func GetVersion() string {
+	return "` + version + "-" + commitId + `"
+}
+`
+	err := ioutil.WriteFile("version.go", []byte(content), 0777)
 	if err != nil {
 		panic(err)
 	}

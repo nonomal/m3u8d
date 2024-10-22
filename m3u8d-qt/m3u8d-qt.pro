@@ -4,7 +4,9 @@
 #
 #-------------------------------------------------
 
-QT       += core gui
+QT       += core gui concurrent
+
+QMAKE_CXXFLAGS += -std=c++11
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
@@ -39,4 +41,10 @@ FORMS += \
         mainwindow.ui \
     curldialog.ui
 
-LIBS += -L$$PWD -lm3u8d-impl
+win32{
+    #静态库
+    LIBS += -L$$PWD -lm3u8d-impl
+} else {
+    #动态库
+    LIBS += $$PWD/m3u8d-impl
+}

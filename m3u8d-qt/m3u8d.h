@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -7,67 +8,89 @@
 //Qt Creator 需要在xxx.pro 内部增加静态库的链接声明
 //LIBS += -L$$PWD -lm3u8d-impl
 
-struct RunDownload_Req{
+struct StartDownload_Req{
 	std::string M3u8Url;
 	bool Insecure;
 	std::string SaveDir;
 	std::string FileName;
-	int32_t SkipTsCountFromHead;
+	std::string SkipTsExpr;
 	std::string SetProxy;
 	std::map<std::string, std::vector<std::string>> HeaderMap;
-	RunDownload_Req(): Insecure(false),SkipTsCountFromHead(0){}
+	bool SkipRemoveTs;
+	bool ProgressBarShow;
+	int32_t ThreadCount;
+	bool SkipCacheCheck;
+	bool SkipMergeTs;
+	bool DebugLog;
+	std::string TsTempDir;
+	bool UseServerSideTime;
+	bool WithSkipLog;
+	StartDownload_Req(): Insecure(false),SkipRemoveTs(false),ProgressBarShow(false),ThreadCount(0),SkipCacheCheck(false),SkipMergeTs(false),DebugLog(false),UseServerSideTime(false),WithSkipLog(false){}
 };
-struct RunDownload_Resp{
-	std::string ErrMsg;
-	bool IsSkipped;
-	bool IsCancel;
-	std::string SaveFileTo;
-	RunDownload_Resp(): IsSkipped(false),IsCancel(false){}
-};
-RunDownload_Resp RunDownload(RunDownload_Req in0);
+std::string StartDownload(StartDownload_Req in0);
 void CloseOldEnv();
-struct GetProgress_Resp{
+struct GetStatus_Resp{
 	int32_t Percent;
 	std::string Title;
-	std::string SleepTh;
-	GetProgress_Resp(): Percent(0){}
+	std::string StatusBar;
+	bool IsDownloading;
+	bool IsCancel;
+	std::string ErrMsg;
+	bool IsSkipped;
+	std::string SaveFileTo;
+	GetStatus_Resp(): Percent(0),IsDownloading(false),IsCancel(false),IsSkipped(false){}
 };
-GetProgress_Resp GetProgress();
+GetStatus_Resp GetStatus();
+GetStatus_Resp WaitDownloadFinish();
 std::string GetWd();
 struct ParseCurl_Resp{
 	std::string ErrMsg;
-	RunDownload_Req DownloadReq;
+	StartDownload_Req DownloadReq;
 };
 ParseCurl_Resp ParseCurlStr(std::string in0);
-std::string RunDownload_Req_ToCurlStr(RunDownload_Req in0);
-
-#include <QObject>
-#include <QVector>
-#include <QThreadPool>
-#include <QMutex>
-#include <QMutexLocker>
+std::string RunDownload_Req_ToCurlStr(StartDownload_Req in0);
+std::string GetFileNameFromUrl(std::string in0);
+struct MergeTsDir_Resp{
+	std::string ErrMsg;
+	bool IsCancel;
+	MergeTsDir_Resp(): IsCancel(false){}
+};
+MergeTsDir_Resp MergeTsDir(std::string in0, std::string in1, bool in2, bool in3);
+void MergeStop();
+struct MergeGetProgressPercent_Resp{
+	std::string Title;
+	int32_t Percent;
+	std::string SpeedText;
+	bool IsRunning;
+	MergeGetProgressPercent_Resp(): Percent(0),IsRunning(false){}
+};
+MergeGetProgressPercent_Resp MergeGetProgressPercent();
+std::string FindUrlInStr(std::string in0);
+std::string GetVersion();
+#include <vector>
 #include <functional>
+#include <QMutex>
+#include <QObject>
+#include <QThreadPool>
+#include <QMutexLocker>
 
 class RunOnUiThread : public QObject
 {
     Q_OBJECT
 public:
-    explicit RunOnUiThread(QObject *parent = nullptr);
     virtual ~RunOnUiThread();
 
     void AddRunFnOn_OtherThread(std::function<void()> fn);
     // !!!注意,fn可能被调用,也可能由于RunOnUiThread被析构不被调用
     // 依赖于在fn里delete回收内存, 关闭文件等操作可能造成内存泄露
     void AddRunFnOn_UiThread(std::function<void ()> fn);
-	bool Get_Done();
-signals:
-    void signal_newFn();
+    bool IsDone();
 private slots:
     void slot_newFn();
 private:
-    bool m_done;
-    QVector<std::function<void()>> m_funcList;
-    QMutex m_Mutex;
+    bool m_done = false;
+    std::vector<std::function<void()>> m_funcList;
+    QMutex m_mutex;
     QThreadPool m_pool;
 };
 

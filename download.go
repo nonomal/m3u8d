@@ -1,296 +1,74 @@
 package m3u8d
 
 import (
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/sha256"
-	"crypto/tls"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/orestonce/gopool"
+	"github.com/orestonce/m3u8d/mformat"
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/orestonce/gopool"
 )
 
-// TsInfo 用于保存 ts 文件的下载地址和文件名
-type TsInfo struct {
-	Name string
-	Url  string
+type GetStatus_Resp struct {
+	Percent       int
+	Title         string
+	StatusBar     string
+	IsDownloading bool
+	IsCancel      bool
+	ErrMsg        string
+	IsSkipped     bool
+	SaveFileTo    string
 }
 
-var gProgressBarTitle string
-var gProgressPercent int
-var gProgressPercentLocker sync.Mutex
+var PNG_SIGN = []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
 
-type GetProgress_Resp struct {
-	Percent int
-	Title   string
-	SleepTh string
+type StartDownload_Req struct {
+	M3u8Url           string
+	Insecure          bool                // "是否允许不安全的请求(默认为false)"
+	SaveDir           string              // "文件保存路径(默认为当前路径)"
+	FileName          string              // 文件名
+	SkipTsExpr        string              // 跳过ts信息，ts编号从1开始，可以以逗号","为分隔符跳过多部分ts，例如: 1,92-100 表示跳过第1号ts、跳过92到100号ts
+	SetProxy          string              //代理
+	HeaderMap         map[string][]string // 自定义http头信息
+	SkipRemoveTs      bool                // 不删除ts文件
+	ProgressBarShow   bool                // 在控制台打印进度条
+	ThreadCount       int                 // 线程数
+	SkipCacheCheck    bool                // 不缓存已下载的m3u8的文件信息
+	SkipMergeTs       bool                // 不合并ts为mp4
+	DebugLog          bool                // 调试日志
+	TsTempDir         string              // 临时ts文件目录
+	UseServerSideTime bool                // 使用服务端提供的文件时间
+	WithSkipLog       bool                // 在mp4旁记录跳过ts文件的信息
 }
 
-func GetProgress() (resp GetProgress_Resp) {
-	gProgressPercentLocker.Lock()
-	resp.Percent = gProgressPercent
-	resp.Title = gProgressBarTitle
-	gProgressPercentLocker.Unlock()
-	if resp.Title == "" {
-		resp.Title = "正在下载"
-	}
-	var sleepTh int32
-	gOldEnvLocker.Lock()
-	if gOldEnv != nil {
-		sleepTh = atomic.LoadInt32(&gOldEnv.sleepTh)
-	}
-	gOldEnvLocker.Unlock()
-	if sleepTh > 0 {
-		resp.SleepTh = "有 " + strconv.Itoa(int(sleepTh)) + "个线程正在休眠."
-	}
-	return resp
-}
-
-func SetProgressBarTitle(title string) {
-	gProgressPercentLocker.Lock()
-	defer gProgressPercentLocker.Unlock()
-	gProgressBarTitle = title
-}
-
-type RunDownload_Resp struct {
-	ErrMsg     string
-	IsSkipped  bool
-	IsCancel   bool
-	SaveFileTo string
-}
-
-type RunDownload_Req struct {
-	M3u8Url             string
-	Insecure            bool   // "是否允许不安全的请求(默认为false)"
-	SaveDir             string // "文件保存路径(默认为当前路径)"
-	FileName            string // 文件名
-	SkipTsCountFromHead int    // 跳过前面几个ts
-	SetProxy            string
-	HeaderMap           map[string][]string
-}
-
-type downloadEnv struct {
-	cancelFn func()
-	ctx      context.Context
-	client   *http.Client
-	header   http.Header
-	sleepTh  int32
-}
-
-func (this *downloadEnv) RunDownload(req RunDownload_Req) (resp RunDownload_Resp) {
-	if req.SaveDir == "" {
-		var err error
-		req.SaveDir, err = os.Getwd()
-		if err != nil {
-			resp.ErrMsg = "os.Getwd error: " + err.Error()
-			return resp
-		}
-	}
-	if req.FileName == "" {
-		req.FileName = "all"
-	}
-	if req.SkipTsCountFromHead < 0 {
-		req.SkipTsCountFromHead = 0
-	}
-	host, err := getHost(req.M3u8Url)
-	if err != nil {
-		resp.ErrMsg = "getHost0: " + err.Error()
-		return resp
-	}
-	this.header = http.Header{
-		"User-Agent":      []string{"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36"},
-		"Connection":      []string{"keep-alive"},
-		"Accept":          []string{"*/*"},
-		"Accept-Encoding": []string{"*"},
-		"Accept-Language": []string{"zh-CN,zh;q=0.9, en;q=0.8, de;q=0.7, *;q=0.5"},
-		"Referer":         []string{host},
-	}
-	for key, valueList := range req.HeaderMap {
-		this.header[key] = valueList
-	}
-	SetProgressBarTitle("[1/6]嗅探m3u8")
-	var m3u8Body []byte
-	var errMsg string
-	req.M3u8Url, m3u8Body, errMsg = this.sniffM3u8(req.M3u8Url)
-	if errMsg != "" {
-		resp.ErrMsg = "sniffM3u8: " + errMsg
-		resp.IsCancel = this.GetIsCancel()
-		return resp
-	}
-	id, err := req.getVideoId()
-	if err != nil {
-		resp.ErrMsg = "getVideoId: " + err.Error()
-		return resp
-	}
-	info, err := cacheRead(req.SaveDir, id)
-	if err != nil {
-		resp.ErrMsg = "cacheRead: " + err.Error()
-		return resp
-	}
-	if info != nil {
-		SetProgressBarTitle("[2/6]检查是否已下载")
-		latestNameFullPath, found := info.SearchVideoInDir(req.SaveDir)
-		if found {
-			resp.IsSkipped = true
-			resp.SaveFileTo = latestNameFullPath
-			return resp
-		}
-	}
-	if !strings.HasPrefix(req.M3u8Url, "http") || req.M3u8Url == "" {
-		resp.ErrMsg = "M3u8Url not valid " + strconv.Quote(req.M3u8Url)
-		return resp
-	}
-	downloadDir := filepath.Join(req.SaveDir, "downloading", id)
-	if !isDirExists(downloadDir) {
-		err = os.MkdirAll(downloadDir, os.ModePerm)
-		if err != nil {
-			resp.ErrMsg = "os.MkdirAll error: " + err.Error()
-			return resp
-		}
-	}
-	// 获取m3u8地址的内容体
-	tsKey, err := this.getM3u8Key(req.M3u8Url, string(m3u8Body))
-	if err != nil {
-		resp.ErrMsg = "getM3u8Key: " + err.Error()
-		resp.IsCancel = this.GetIsCancel()
-		return resp
-	}
-	SetProgressBarTitle("[3/6]获取ts列表")
-	tsList, errMsg := getTsList(req.M3u8Url, string(m3u8Body))
-	if errMsg != "" {
-		resp.ErrMsg = "获取ts列表错误: " + errMsg
-		return resp
-	}
-	if len(tsList) <= req.SkipTsCountFromHead {
-		resp.ErrMsg = "需要下载的文件为空"
-		return resp
-	}
-	tsList = tsList[req.SkipTsCountFromHead:]
-	// 下载ts
-	SetProgressBarTitle("[4/6]下载ts")
-	err = this.downloader(tsList, downloadDir, tsKey)
-	if err != nil {
-		resp.ErrMsg = "下载ts文件错误: " + err.Error()
-		resp.IsCancel = this.GetIsCancel()
-		return resp
-	}
-	DrawProgressBar(1, 1)
-	var tsFileList []string
-	for _, one := range tsList {
-		tsFileList = append(tsFileList, filepath.Join(downloadDir, one.Name))
-	}
-	var tmpOutputName string
-	var contentHash string
-	tmpOutputName = filepath.Join(downloadDir, "all.merge.mp4")
-
-	SetProgressBarTitle("[5/6]合并ts为mp4")
-	err = MergeTsFileListToSingleMp4(MergeTsFileListToSingleMp4_Req{
-		TsFileList: tsFileList,
-		OutputMp4:  tmpOutputName,
-		Ctx:        this.ctx,
-	})
-	if err != nil {
-		resp.ErrMsg = "合并错误: " + err.Error()
-		return resp
-	}
-	SetProgressBarTitle("[6/6]计算文件hash")
-	contentHash = getFileSha256(tmpOutputName)
-	if contentHash == "" {
-		resp.ErrMsg = "无法计算摘要信息: " + tmpOutputName
-		return resp
-	}
-	var name string
-	for idx := 0; ; idx++ {
-		idxS := strconv.Itoa(idx)
-		if len(idxS) < 4 {
-			idxS = strings.Repeat("0", 4-len(idxS)) + idxS
-		}
-		idxS = "_" + idxS
-		if idx == 0 {
-			name = filepath.Join(req.SaveDir, req.FileName+".mp4")
-		} else {
-			name = filepath.Join(req.SaveDir, req.FileName+idxS+".mp4")
-		}
-		if !isFileExists(name) {
-			resp.SaveFileTo = name
-			break
-		}
-		if idx > 10000 { // 超过1万就不找了
-			resp.ErrMsg = "自动寻找文件名失败"
-			return resp
-		}
-	}
-	err = os.Rename(tmpOutputName, name)
-	if err != nil {
-		resp.ErrMsg = "重命名失败: " + err.Error()
-		return resp
-	}
-	err = cacheWrite(req.SaveDir, id, req, resp.SaveFileTo, contentHash)
-	if err != nil {
-		resp.ErrMsg = "cacheWrite: " + err.Error()
-		return resp
-	}
-	err = os.RemoveAll(downloadDir)
-	if err != nil {
-		resp.ErrMsg = "删除下载目录失败: " + err.Error()
-		return resp
-	}
-	// 如果downloading目录为空,就删除掉,否则忽略
-	_ = os.Remove(filepath.Join(req.SaveDir, "downloading"))
-	return resp
-}
-
-var gOldEnv *downloadEnv
-var gOldEnvLocker sync.Mutex
-
-func RunDownload(req RunDownload_Req) (resp RunDownload_Resp) {
-	req.SetProxy = strings.ToLower(req.SetProxy)
-	env := &downloadEnv{
-		client: &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: req.Insecure,
-				},
-				DialContext: newDialContext(req.SetProxy),
-			},
-			Timeout: time.Second * 10,
-		},
-	}
-	env.ctx, env.cancelFn = context.WithCancel(context.Background())
-
-	gOldEnvLocker.Lock()
-	if gOldEnv != nil {
-		gOldEnv.cancelFn()
-	}
-	gOldEnv = env
-	gOldEnvLocker.Unlock()
-	resp = env.RunDownload(req)
-	SetProgressBarTitle("下载进度")
-	DrawProgressBar(1, 0)
-	return resp
-}
-
-func CloseOldEnv() {
-	gOldEnvLocker.Lock()
-	defer gOldEnvLocker.Unlock()
-	if gOldEnv != nil {
-		gOldEnv.cancelFn()
-	}
-	gOldEnv = nil
+type DownloadEnv struct {
+	cancelFn      func()
+	ctx           context.Context
+	nowClient     *http.Client
+	header        http.Header
+	sleepTh       int32
+	status        SpeedStatus
+	logFile       *os.File
+	logFileLocker sync.Mutex
 }
 
 // 获取m3u8地址的host
@@ -302,90 +80,103 @@ func getHost(Url string) (host string, err error) {
 	return u.Scheme + "://" + u.Host, nil
 }
 
-func GetWd() string {
-	wd, _ := os.Getwd()
-	return wd
+func updateTsUrl(m3u8Url string, tsList []mformat.TsInfo) (errMsg string) {
+	for idx := range tsList {
+		ts := &tsList[idx]
+		ts.Url, errMsg = ResolveRefUrl(m3u8Url, ts.URI)
+		if errMsg != "" {
+			return "ts.URI = " + ts.URI + ", error " + errMsg
+		}
+	}
+	return ""
 }
 
-// 获取m3u8加密的密钥
-func (this *downloadEnv) getM3u8Key(m3u8Url string, html string) (key string, err error) {
-	key = ""
-	for _, line := range splitLineWithTrimSpace(html) {
-		if strings.Contains(line, "#EXT-X-KEY") == false {
-			continue
-		}
-		uriPos := strings.Index(line, "URI")
-		quotationMarkPos := strings.LastIndex(line, "\"")
-		keyUrl := strings.Split(line[uriPos:quotationMarkPos], "\"")[1]
-		if !strings.Contains(line, "http") {
-			var errMsg string
-			keyUrl, errMsg = resolveRefUrl(m3u8Url, line)
-			if errMsg != "" {
-				return "", errors.New(errMsg)
+// updateMediaKeyContent 下载ts媒体的加密key的内容
+func (this *DownloadEnv) updateMediaKeyContent(m3u8Url string, tsList []mformat.TsInfo) (errMsg string) {
+	uriToContentMap := map[string][]byte{}
+
+	for idx := range tsList {
+		ts := &tsList[idx]
+		if ts.Key.Method != `` {
+			keyContent, ok := uriToContentMap[ts.Key.KeyURI]
+			if ok == false {
+				var keyUrl string
+				keyUrl, errMsg = ResolveRefUrl(m3u8Url, ts.Key.KeyURI)
+				if errMsg != "" {
+					return "ts.Key.KeyURI = " + ts.Key.KeyURI + ", error " + errMsg
+				}
+				var httpResp *http.Response
+				var err error
+				keyContent, httpResp, err = this.doGetRequest(keyUrl, true)
+				if err != nil {
+					return "ts.Key.KeyURI = " + ts.Key.KeyURI + ", http error " + err.Error()
+				}
+				if httpResp.StatusCode != 200 {
+					return "ts.Key.KeyURI = " + ts.Key.KeyURI + ", http code error " + strconv.Itoa(httpResp.StatusCode)
+				}
+				if ts.Key.Method == mformat.EncryptMethod_AES128 && len(keyContent) != 16 { // Aes 128
+					return "ts.Key.KeyURI = " + ts.Key.KeyURI + ", invalid key " + strconv.Quote(string(keyContent))
+				}
+				uriToContentMap[ts.Key.KeyURI] = keyContent
 			}
-		}
-		var res []byte
-		res, err = this.doGetRequest(keyUrl)
-		if err != nil {
-			return "", err
-		}
-		return string(res), nil
-	}
-	return "", nil
-}
-
-func splitLineWithTrimSpace(s string) []string {
-	tmp := strings.Split(s, "\n")
-	for idx, str := range tmp {
-		str = strings.TrimSpace(str)
-		tmp[idx] = str
-	}
-	return tmp
-}
-
-func getTsList(m38uUrl string, body string) (tsList []TsInfo, errMsg string) {
-	index := 0
-
-	for _, line := range splitLineWithTrimSpace(body) {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "#") && line != "" {
-			index++
-			var after string
-			after, errMsg = resolveRefUrl(m38uUrl, line)
-			if errMsg != "" {
-				return nil, errMsg
-			}
-			tsList = append(tsList, TsInfo{
-				Name: fmt.Sprintf("%05d.ts", index), // ts视频片段命名规则
-				Url:  after,
-			})
+			ts.Key.KeyContent = keyContent
 		}
 	}
-	return tsList, ""
+	return ""
 }
 
 // 下载ts文件
 // @modify: 2020-08-13 修复ts格式SyncByte合并不能播放问题
-func (this *downloadEnv) downloadTsFile(ts TsInfo, download_dir, key string) (err error) {
-	currPath := fmt.Sprintf("%s/%s", download_dir, ts.Name)
-	if isFileExists(currPath) {
+func (this *DownloadEnv) downloadTsFile(ts *mformat.TsInfo, skipInfo SkipTsInfo, downloadDir string, useServerSideTime bool) (err error) {
+	currPath := filepath.Join(downloadDir, ts.Name)
+	var stat os.FileInfo
+	stat, err = os.Stat(currPath)
+	if err == nil && stat.Mode().IsRegular() {
+		this.status.SpeedAdd1Block(stat.ModTime(), int(stat.Size()))
 		return nil
 	}
-	data, err := this.doGetRequest(ts.Url)
+	beginTime := time.Now()
+	data, httpResp, err := this.doGetRequest(ts.Url, false)
 	if err != nil {
 		return err
+	}
+	if httpResp.StatusCode != 200 {
+		if len(skipInfo.HttpCodeList) > 0 && isInIntSlice(httpResp.StatusCode, skipInfo.HttpCodeList) {
+			this.status.SpeedAdd1Block(beginTime, 0)
+			ts.SkipByHttpCode = true
+			ts.HttpCode = httpResp.StatusCode
+			this.logToFile("skip ts " + strconv.Quote(ts.Name) + " byHttpCode: " + strconv.Itoa(httpResp.StatusCode))
+			return nil
+		}
+		return errors.New(`invalid http status code: ` + strconv.Itoa(httpResp.StatusCode) + ` url: ` + ts.Url)
+	}
+	var mTime time.Time
+	if mStr := httpResp.Header.Get("Last-Modified"); mStr != "" && useServerSideTime {
+		this.logToFile("get mtime " + strconv.Quote(mStr))
+		mTime, err = time.Parse(time.RFC1123, mStr)
+		// 这个错误不重要, 所以只记录日志
+		if err != nil {
+			this.logToFile("parse mtime error " + err.Error())
+			mTime = time.Time{}
+		}
 	}
 	// 校验长度是否合法
 	var origData []byte
 	origData = data
 	// 解密出视频 ts 源文件
-	if key != "" {
+	if ts.Key.Method != "" {
 		//解密 ts 文件，算法：aes 128 cbc pack5
-		origData, err = AesDecrypt(origData, []byte(key))
+		origData, err = mformat.AesDecrypt(origData, ts.Key)
 		if err != nil {
 			return err
 		}
 	}
+
+	// Detect Fake png file
+	if bytes.HasPrefix(origData, PNG_SIGN) {
+		origData = origData[8:]
+	}
+
 	// https://en.wikipedia.org/wiki/MPEG_transport_stream
 	// Some TS files do not start with SyncByte 0x47, they can not be played after merging,
 	// Need to remove the bytes before the SyncByte 0x47(71).
@@ -402,27 +193,55 @@ func (this *downloadEnv) downloadTsFile(ts TsInfo, download_dir, key string) (er
 	if err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, currPath)
+	err = os.Rename(tmpPath, currPath)
+	if err != nil {
+		return err
+	}
+	if mTime.IsZero() == false {
+		err = os.Chtimes(currPath, mTime, mTime)
+		// 这个错误不重要, 所以只记录日志
+		if err != nil {
+			this.logToFile("os.Chtimes error " + err.Error())
+		}
+	}
+	this.status.SpeedAdd1Block(beginTime, len(origData))
+	return nil
 }
 
-func (this *downloadEnv) SleepDur(d time.Duration) {
+func isInIntSlice(i int, list []int) bool {
+	for _, one := range list {
+		if i == one {
+			return true
+		}
+	}
+	return false
+}
+
+func (this *DownloadEnv) SleepDur(d time.Duration) {
 	select {
 	case <-time.After(d):
 	case <-this.ctx.Done():
 	}
 }
 
-func (this *downloadEnv) downloader(tsList []TsInfo, downloadDir string, key string) (err error) {
-	task := gopool.NewThreadPool(1)
-	tsLen := len(tsList)
-	downloadCount := 0
+func (this *DownloadEnv) downloader(tsList []mformat.TsInfo, skipInfo SkipTsInfo, downloadDir string, req StartDownload_Req) (err error) {
+	if req.ThreadCount <= 0 || req.ThreadCount > 1000 {
+		return errors.New("DownloadEnv.threadCount invalid: " + strconv.Itoa(req.ThreadCount))
+	}
+	task := gopool.NewThreadPool(req.ThreadCount)
 	var locker sync.Mutex
 
-	for _, ts := range tsList {
-		ts := ts
+	this.status.SpeedResetTotalBlockCount(len(tsList))
+
+	for idx := range tsList {
+		ts := &tsList[idx]
 		task.AddJob(func() {
 			var lastErr error
 			for i := 0; i < 5; i++ {
+				if this.GetIsCancel() {
+					break
+				}
+
 				locker.Lock()
 				if err != nil {
 					locker.Unlock()
@@ -434,59 +253,29 @@ func (this *downloadEnv) downloader(tsList []TsInfo, downloadDir string, key str
 					this.SleepDur(time.Second * time.Duration(i))
 					atomic.AddInt32(&this.sleepTh, -1)
 				}
-				lastErr = this.downloadTsFile(ts, downloadDir, key)
+				lastErr = this.downloadTsFile(ts, skipInfo, downloadDir, req.UseServerSideTime)
 				if lastErr == nil {
-					break
-				}
-				if this.GetIsCancel() {
 					break
 				}
 			}
 			if lastErr != nil {
 				locker.Lock()
 				if err == nil {
-					err = lastErr
+					err = fmt.Errorf("%v: %v", ts.Name, lastErr.Error())
 				}
 				locker.Unlock()
+
+				this.status.setTsNotWriteReason(ts, "download: "+lastErr.Error())
+			} else if ts.SkipByHttpCode {
+				this.status.setTsNotWriteReason(ts, "skipByHttpCode: "+strconv.Itoa(ts.HttpCode))
+			} else if this.GetIsCancel() {
+				this.status.setTsNotWriteReason(ts, "用户取消")
 			}
-			locker.Lock()
-			downloadCount++
-			DrawProgressBar(tsLen, downloadCount)
-			locker.Unlock()
 		})
 	}
 	task.CloseAndWait()
 
 	return err
-}
-
-var gShowProgressBar bool
-var gShowProgressBarLocker sync.Mutex
-
-func SetShowProgressBar() {
-	gShowProgressBarLocker.Lock()
-	gShowProgressBar = true
-	gShowProgressBarLocker.Unlock()
-}
-
-// 进度条
-func DrawProgressBar(total int, current int) {
-	if total == 0 {
-		return
-	}
-	proportion := float32(current) / float32(total)
-	gProgressPercentLocker.Lock()
-	gProgressPercent = int(proportion * 100)
-	title := gProgressBarTitle
-	gProgressPercentLocker.Unlock()
-
-	gShowProgressBarLocker.Lock()
-	if gShowProgressBar {
-		width := 50
-		pos := int(proportion * float32(width))
-		fmt.Printf(title+" %s%*s %6.2f%%\r", strings.Repeat("■", pos), width-pos, "", proportion*100)
-	}
-	gShowProgressBarLocker.Unlock()
 }
 
 func isFileExists(path string) bool {
@@ -499,89 +288,45 @@ func isDirExists(path string) bool {
 	return err == nil && stat.IsDir()
 }
 
-// ============================== 加解密相关 ==============================
-
-func PKCS7UnPadding(origData []byte) []byte {
-	length := len(origData)
-	unpadding := int(origData[length-1])
-	return origData[:(length - unpadding)]
-}
-
-func AesDecrypt(crypted, key []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	blockSize := block.BlockSize()
-	blockMode := cipher.NewCBCDecrypter(block, key[:blockSize])
-	origData := make([]byte, len(crypted))
-	blockMode.CryptBlocks(origData, crypted)
-	origData = PKCS7UnPadding(origData)
-	return origData, nil
-}
-
-func getFileSha256(targetFile string) (v string) {
-	fin, err := os.Open(targetFile)
-	if err != nil {
-		return ""
-	}
-	defer fin.Close()
-
-	sha256Obj := sha256.New()
-	_, err = io.Copy(sha256Obj, fin)
-	if err != nil {
-		return ""
-	}
-	tmp := sha256Obj.Sum(nil)
-	return hex.EncodeToString(tmp[:])
-}
-
-func (this *downloadEnv) sniffM3u8(urlS string) (afterUrl string, content []byte, errMsg string) {
+func (this *DownloadEnv) sniffM3u8(urlS string) (afterUrl string, info mformat.M3U8File, errMsg string) {
 	for idx := 0; idx < 5; idx++ {
-		var err error
-		content, err = this.doGetRequest(urlS)
+		content, httpResp, err := this.doGetRequest(urlS, true)
 		if err != nil {
-			return "", nil, err.Error()
+			return "", info, err.Error()
 		}
-		if UrlHasSuffix(urlS, ".m3u8") {
+		if httpResp.StatusCode != 200 {
+			return "", info, "invalid httpCode " + strconv.Itoa(httpResp.StatusCode)
+		}
+		var ok bool
+		info, ok = mformat.M3U8Parse(content)
+		if ok {
 			// 看这个是不是嵌套的m3u8
-			var m3u8Url string
-			containsTs := false
-			for _, line := range splitLineWithTrimSpace(string(content)) {
-				if strings.HasPrefix(line, "#") {
-					continue
+			if info.IsNestedPlaylists() {
+				playlist := info.LookupHDPlaylist()
+				if playlist == nil {
+					return "", info, "lookup playlist failed"
 				}
-				if UrlHasSuffix(line, ".m3u8") {
-					m3u8Url = line
-					break
+				urlS, errMsg = ResolveRefUrl(urlS, playlist.URI)
+				if errMsg != "" {
+					return "", info, errMsg
 				}
-				if UrlHasSuffix(line, ".ts") {
-					containsTs = true
-					break
-				}
+				continue
 			}
-			if containsTs {
-				return urlS, content, ""
+			if info.ContainsMediaSegment() {
+				return urlS, info, ""
 			}
-			if m3u8Url == "" {
-				return "", nil, "未发现m3u8资源_1"
-			}
-			urlS, errMsg = resolveRefUrl(urlS, m3u8Url)
-			if errMsg != "" {
-				return "", nil, errMsg
-			}
-			continue
+			return "", info, "未发现m3u8资源_1"
 		}
 		groups := regexp.MustCompile(`http[s]://[a-zA-Z0-9/\\.%_-]+.m3u8`).FindSubmatch(content)
 		if len(groups) == 0 {
-			return "", nil, "未发现m3u8资源_2"
+			return "", info, "未发现m3u8资源_2"
 		}
 		urlS = string(groups[0])
 	}
-	return "", nil, "未发现m3u8资源_3"
+	return "", info, "未发现m3u8资源_3"
 }
 
-func resolveRefUrl(baseUrl string, extUrl string) (after string, errMsg string) {
+func ResolveRefUrl(baseUrl string, extUrl string) (after string, errMsg string) {
 	urlObj, err := url.Parse(baseUrl)
 	if err != nil {
 		return "", err.Error()
@@ -601,34 +346,260 @@ func UrlHasSuffix(urlS string, suff string) bool {
 	return strings.HasSuffix(strings.ToLower(urlObj.Path), suff)
 }
 
-func (this *downloadEnv) doGetRequest(urlS string) (data []byte, err error) {
+func (this *DownloadEnv) doGetRequest(urlS string, dumpRespBody bool) (data []byte, resp *http.Response, err error) {
 	req, err := http.NewRequest(http.MethodGet, urlS, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	req = req.WithContext(this.ctx)
 	req.Header = this.header
-	resp, err := this.client.Do(req)
+
+	var logBuf *bytes.Buffer
+
+	this.logFileLocker.Lock()
+	if this.logFile != nil {
+		logBuf = bytes.NewBuffer(nil)
+		logBuf.WriteString("http get url " + strconv.Quote(urlS) + "\n")
+		reqBytes, _ := httputil.DumpRequest(req, false)
+		logBuf.WriteString("httpReq:\n" + string(reqBytes) + "\n")
+	}
+	this.logFileLocker.Unlock()
+
+	beginTime := time.Now()
+
+	resp, err = this.nowClient.Do(req)
+	if logBuf != nil && resp != nil {
+		respBytes, _ := httputil.DumpResponse(resp, false)
+		logBuf.WriteString("httpResp:\n" + string(respBytes) + "\n")
+		logBuf.WriteString("time1: " + time.Since(beginTime).String() + "\n")
+		beginTime = time.Now()
+	}
+
 	if err != nil {
-		return nil, err
+		if logBuf != nil {
+			logBuf.WriteString("error1:" + err.Error() + "\n")
+			this.logToFile(logBuf.String())
+		}
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 
-	content, err := io.ReadAll(resp.Body)
+	var content []byte
+	var readCloser io.ReadCloser
+
+	contentEncoding := resp.Header.Get("Content-Encoding")
+	switch contentEncoding {
+	case "gzip":
+		readCloser, err = gzip.NewReader(resp.Body)
+		if err != nil {
+			err = errors.New("error2: gzip.new error " + err.Error())
+			if logBuf != nil {
+				logBuf.WriteString(err.Error() + "\n")
+				this.logToFile(logBuf.String())
+			}
+			return nil, nil, err
+		}
+		defer readCloser.Close()
+	case "deflate":
+		readCloser = flate.NewReader(resp.Body)
+		defer readCloser.Close()
+	case "":
+		readCloser = resp.Body
+	default:
+		err = errors.New("error3: unsupported Content-Encoding " + strconv.Quote(contentEncoding))
+		if logBuf != nil {
+			logBuf.WriteString(err.Error() + "\n")
+			this.logToFile(logBuf.String())
+		}
+		return nil, nil, err
+	}
+	content, err = this.status.SpeedReadAll(readCloser)
+	if logBuf != nil {
+		logBuf.WriteString("time4: " + time.Since(beginTime).String() + ", bytes: " + strconv.Itoa(len(content)) + "\n")
+	}
 	if err != nil {
-		return nil, err
+		if logBuf != nil {
+			logBuf.WriteString("error4:" + err.Error() + "\n")
+			this.logToFile(logBuf.String())
+		}
+		return nil, nil, err
 	}
-	if resp.StatusCode != 200 {
-		return content, errors.New("resp.Status: " + resp.Status + " " + urlS)
+	if logBuf != nil && dumpRespBody {
+		logBuf.WriteString("httpRespBody:\n" + string(content))
 	}
-	return content, nil
+	if logBuf != nil {
+		this.logToFile(logBuf.String())
+	}
+	return content, resp, nil
 }
 
-func (this *downloadEnv) GetIsCancel() bool {
+func (this *DownloadEnv) logToFile(body string) {
+	this.logFileLocker.Lock()
+	defer this.logFileLocker.Unlock()
+
+	if this.logFile == nil {
+		return
+	}
+
+	timeStr := time.Now().Format("2006-01-02_15:04:05")
+	this.logFile.WriteString("===>time: " + timeStr + "\n")
+	this.logFile.WriteString(body)
+	if strings.HasSuffix(body, "\n") == false {
+		this.logFile.WriteString("\n")
+	}
+}
+
+func (this *DownloadEnv) logToFile_TsNotWriteReason() {
+	this.logFileLocker.Lock()
+	skip := this.logFile == nil
+	this.logFileLocker.Unlock()
+
+	if skip {
+		return
+	}
+
+	var list []tsNotWriteReasonUnit
+
+	this.status.Locker.Lock()
+	for _, one := range this.status.tsNotWriteReasonMap {
+		list = append(list, one)
+	}
+	this.status.Locker.Unlock()
+
+	if len(list) == 0 {
+		return
+	}
+
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].fileName < list[j].fileName
+	})
+
+	this.logFileLocker.Lock()
+	defer this.logFileLocker.Unlock()
+
+	if this.logFile == nil {
+		return
+	}
+
+	this.logFile.WriteString("---- ERROR TS ----\n")
+	for idx, one := range list {
+		if idx > 0 {
+			this.logFile.WriteString("\n")
+		}
+		this.logFile.WriteString(one.fileName)
+		this.logFile.WriteString("\n")
+		this.logFile.WriteString(one.downloadUrl)
+		this.logFile.WriteString("\n")
+		this.logFile.WriteString(one.reason)
+		this.logFile.WriteString("\n")
+	}
+	this.logFile.WriteString("---- END ----\n")
+}
+
+func (this *DownloadEnv) GetIsCancel() bool {
+	this.status.Locker.Lock()
+	defer this.status.Locker.Unlock()
+	return IsContextCancel(this.ctx)
+}
+
+func GetWd() string {
+	wd, _ := os.Getwd()
+	return wd
+}
+
+func (this *DownloadEnv) CloseEnv() {
+	this.status.Locker.Lock()
+	if !this.status.IsRunning {
+		this.status.Locker.Unlock()
+		return
+	}
+
+	if this.cancelFn != nil {
+		this.cancelFn()
+	}
+	ctx := this.ctx
+	this.status.Locker.Unlock()
+
+	if ctx == nil {
+		return
+	}
+	<-ctx.Done()
+}
+
+func (this *DownloadEnv) logFileClose() {
+	this.logFileLocker.Lock()
+	defer this.logFileLocker.Unlock()
+
+	if this.logFile != nil {
+		this.logFile.Close()
+		this.logFile = nil
+	}
+}
+
+func (this *DownloadEnv) writeFfmpegCmd(downloadingDir string, list []mformat.TsInfo) (err error) {
+	const listFileName = "filelist.txt"
+
+	var fileListLog bytes.Buffer
+	for _, one := range list {
+		if one.SkipByHttpCode {
+			continue
+		}
+		fileListLog.WriteString("file " + one.Name + "\n")
+	}
+	err = os.WriteFile(filepath.Join(downloadingDir, listFileName), fileListLog.Bytes(), 0777)
+	if err != nil {
+		return errors.New("写入" + listFileName + "失败, " + err.Error())
+	}
+
+	var ffmpegCmdContent = "ffmpeg -f concat -i " + listFileName + " -c copy -y output.mp4"
+	var ffmpegCmdFileName = "merge-by-ffmpeg"
+	if runtime.GOOS == `windows` {
+		ffmpegCmdContent += "\r\npause"
+		ffmpegCmdFileName += ".bat"
+	} else {
+		ffmpegCmdFileName += ".sh"
+	}
+
+	err = os.WriteFile(filepath.Join(downloadingDir, ffmpegCmdFileName), []byte(ffmpegCmdContent), 0777)
+	if err != nil {
+		return errors.New("写入" + ffmpegCmdFileName + "失败, " + err.Error())
+	}
+
+	return nil
+}
+
+func (this *DownloadEnv) writeSkipByHttpCodeInfoTxt(tsSaveDir string, list []mformat.TsInfo) error {
+	var skipByHttpCodeLog bytes.Buffer
+	for _, one := range list {
+		fmt.Fprintf(&skipByHttpCodeLog, "http.code=%v,filename=%v,url=%v\n", one.HttpCode, one.Name, one.Url)
+	}
+	return os.WriteFile(filepath.Join(tsSaveDir, logFileName), skipByHttpCodeLog.Bytes(), 0666)
+}
+
+func IsContextCancel(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
 	select {
-	case <-this.ctx.Done():
+	case <-ctx.Done():
 		return true
 	default:
 		return false
 	}
+}
+
+func GetFileNameFromUrl(u string) string {
+	urlObj, err := url.Parse(u)
+	if err != nil || urlObj.Scheme == "" {
+		return "all"
+	}
+	name := path.Base(urlObj.Path)
+	if name == "" {
+		return "all"
+	}
+	ext := path.Ext(name)
+	if len(name) > len(ext) {
+		return strings.TrimSuffix(name, ext)
+	}
+	return name
 }
